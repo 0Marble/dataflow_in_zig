@@ -1,6 +1,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const cfg = @import("cfg.zig");
+const dfa = @import("dfa.zig");
+
 const Op = enum { Add, Sub, Mul, Div, None };
 
 const Command = struct {
@@ -9,452 +12,391 @@ const Command = struct {
     b: u8,
     op: Op,
     idx: usize,
+
+    pub fn format(self: @This(), fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("{c} = {c}", .{ self.lhs, self.a });
+        switch (self.op) {
+            .Add => try writer.print(" + {c}", .{self.b}),
+            .Sub => try writer.print(" - {c}", .{self.b}),
+            .Mul => try writer.print(" * {c}", .{self.b}),
+            .Div => try writer.print(" / {c}", .{self.b}),
+            .None => {},
+        }
+    }
 };
 
-const Block = struct {
-    commands: std.ArrayList(Command),
+const Cfg = cfg.Cfg(Command);
+const Block = Cfg.Block;
 
-    pub fn init(allocator: std.mem.Allocator) @This() {
-        return .{ .commands = std.ArrayList(Command).init(allocator) };
-    }
-    pub fn deinit(self: *@This()) void {
-        self.commands.deinit();
-    }
-};
-
-const Cfg = struct {
-    entry: usize = 0,
-    exit: usize = 1,
-    blocks: std.ArrayList(Block),
-    buf_size: usize = 10,
-    pred_ids: std.ArrayList(std.DynamicBitSet),
-    succ_ids: std.ArrayList(std.DynamicBitSet),
-
-    dfa_in_sets: std.ArrayList(std.DynamicBitSet),
-    dfa_out_sets: std.ArrayList(std.DynamicBitSet),
-    dfa_gen_sets: std.ArrayList(std.DynamicBitSet),
-    dfa_kill_sets: std.ArrayList(std.DynamicBitSet),
-
-    temp_gen: std.DynamicBitSet,
-    temp_kill: std.DynamicBitSet,
-    temp: std.DynamicBitSet,
-
-    allocator: std.mem.Allocator,
+pub const RdTransfer = struct {
+    cmds: std.ArrayList(Command),
+    gkt: dfa.GenKillTransfer(Command),
 
     const Self = @This();
-
-    pub fn deinit(self: *@This()) void {
-        for (self.blocks.items) |*b| b.deinit();
-        for (self.pred_ids.items) |*b| b.deinit();
-        for (self.succ_ids.items) |*b| b.deinit();
-        for (self.dfa_in_sets.items) |*b| b.deinit();
-        for (self.dfa_out_sets.items) |*b| b.deinit();
-        for (self.dfa_gen_sets.items) |*b| b.deinit();
-        for (self.dfa_kill_sets.items) |*b| b.deinit();
-        self.blocks.deinit();
-        self.pred_ids.deinit();
-        self.succ_ids.deinit();
-        self.dfa_in_sets.deinit();
-        self.dfa_out_sets.deinit();
-        self.dfa_gen_sets.deinit();
-        self.dfa_kill_sets.deinit();
-        self.temp.deinit();
-        self.temp_gen.deinit();
-        self.temp_kill.deinit();
-    }
-
-    inline fn initSetTo(set: *std.DynamicBitSet, val: *const std.DynamicBitSet) !void {
-        const new_len = val.unmanaged.bit_length;
-        try Self.initSetToEmpty(set, new_len);
-        set.setUnion(val.*);
-    }
-    fn initSetToEmpty(set: *std.DynamicBitSet, new_len: usize) !void {
-        const old_len = set.unmanaged.bit_length;
-
-        if (old_len != new_len) {
-            try set.resize(new_len, false);
-        }
-        set.setRangeValue(.{ .start = 0, .end = new_len }, false);
-    }
-    fn initSetToFull(set: *std.DynamicBitSet, new_len: usize) !void {
-        const old_len = set.unmanaged.bit_length;
-
-        if (old_len != new_len) {
-            try set.resize(new_len, true);
-        }
-        set.setRangeValue(.{ .start = 0, .end = new_len }, false);
-    }
-
-    pub const TransferFn = fn (
-        *const Block,
-        *const std.DynamicBitSet, // cur
-        *std.DynamicBitSet, // GEN
-        *std.DynamicBitSet, // KILL
-        anytype, // extra
-    ) void;
-    pub const MeetFn = fn (
-        *std.DynamicBitSet, // result of MEET
-        *const std.DynamicBitSet, // inds of args
-        []std.DynamicBitSet, // all possible args
-    ) void;
-    pub const Dir = enum { Forward, Backward };
-    pub fn dfa(
-        self: *Self,
-        edge: std.DynamicBitSet,
-        default: std.DynamicBitSet,
-        dir: Dir,
-        transfer: TransferFn,
-        extra: anytype,
-        meet: MeetFn,
-    ) !void {
-        const cnt = edge.unmanaged.bit_length;
-        assert(cnt == default.unmanaged.bit_length);
-        for (self.dfa_out_sets.items) |*old| try Self.initSetToEmpty(old, cnt);
-        for (self.dfa_in_sets.items) |*old| try Self.initSetToEmpty(old, cnt);
-        for (self.dfa_gen_sets.items) |*old| try Self.initSetToEmpty(old, cnt);
-        for (self.dfa_kill_sets.items) |*old| try Self.initSetToEmpty(old, cnt);
-
-        if (dir == .Forward) {
-            for (self.dfa_out_sets.items) |*set| try Self.initSetTo(set, &default);
-            try Self.initSetTo(&self.dfa_out_sets.items[self.entry], &edge);
-
-            var changed = true;
-            while (changed) {
-                changed = false;
-                for (self.blocks.items[1..], 1..) |*block, cur| {
-                    const cur_in = &self.dfa_in_sets.items[cur];
-                    const cur_out = &self.dfa_out_sets.items[cur];
-
-                    try Self.initSetToEmpty(&self.temp, cnt);
-                    try Self.initSetToEmpty(&self.temp_gen, cnt);
-                    try Self.initSetToEmpty(&self.temp_kill, cnt);
-
-                    meet(cur_in, &self.pred_ids.items[cur], self.dfa_out_sets.items);
-                    transfer(block, cur_in, &self.temp_gen, &self.temp_kill, extra);
-
-                    self.dfa_gen_sets.items[cur].setUnion(self.temp_gen);
-                    self.dfa_kill_sets.items[cur].setUnion(self.temp_kill);
-
-                    try Self.initSetTo(&self.temp, cur_in);
-                    self.temp_kill.toggleAll();
-                    self.temp.setIntersection(self.temp_kill);
-                    self.temp.setUnion(self.temp_gen);
-
-                    if (!self.temp.eql(cur_out.*)) {
-                        changed = true;
-                        try Self.initSetTo(cur_out, &self.temp);
-                    }
-                }
-            }
-        } else if (dir == .Backward) {
-            for (self.dfa_in_sets.items) |*set| try Self.initSetTo(set, &default);
-            try Self.initSetTo(&self.dfa_in_sets.items[self.exit], &edge);
-
-            var changed = true;
-            while (changed) {
-                changed = false;
-                for (self.blocks.items, 0..) |*block, cur| {
-                    if (cur == self.exit) continue;
-
-                    const cur_in = &self.dfa_in_sets.items[cur];
-                    const cur_out = &self.dfa_out_sets.items[cur];
-
-                    try Self.initSetToEmpty(&self.temp, cnt);
-                    try Self.initSetToEmpty(&self.temp_gen, cnt);
-                    try Self.initSetToEmpty(&self.temp_kill, cnt);
-
-                    meet(cur_out, &self.succ_ids.items[cur], self.dfa_in_sets.items);
-                    transfer(block, cur_out, &self.temp_gen, &self.temp_kill, extra);
-
-                    self.dfa_gen_sets.items[cur].setUnion(self.temp_gen);
-                    self.dfa_kill_sets.items[cur].setUnion(self.temp_kill);
-
-                    try Self.initSetTo(&self.temp, cur_out);
-                    self.temp_kill.toggleAll();
-                    self.temp.setIntersection(self.temp_kill);
-                    self.temp.setUnion(self.temp_gen);
-
-                    if (!self.temp.eql(cur_in.*)) {
-                        changed = true;
-                        try Self.initSetTo(cur_in, &self.temp);
-                    }
-                }
-            }
-        }
-    }
-
-    inline fn printSet(writer: std.io.AnyWriter, set: *const std.DynamicBitSet) !void {
-        try writer.print("[", .{});
-        var it = set.iterator(.{});
-        while (it.next()) |idx| {
-            try writer.print("{}, ", .{idx});
-        }
-        try writer.print("]", .{});
-    }
-
-    pub const NameFn = fn (std.io.AnyWriter, usize, anytype) anyerror!void;
-    fn printSetRenamed(
-        writer: std.io.AnyWriter,
-        set: *const std.DynamicBitSet,
-        name_fn: NameFn,
-        extra: anytype,
-    ) !void {
-        try writer.print("[", .{});
-        var it = set.iterator(.{});
-        while (it.next()) |idx| {
-            try name_fn(writer, idx, extra);
-            try writer.print(", ", .{});
-        }
-        try writer.print("]", .{});
-    }
-
-    pub fn dump(self: *const Self, writer: std.io.AnyWriter, name_fn: NameFn, extra: anytype) !void {
-        try writer.print("digraph {{\nnode [shape=record];\n", .{});
-        try writer.print("{} [label=\"ENTRY\"];\n{} [label=\"EXIT\"];\n", .{ self.entry, self.exit });
-
-        for (self.blocks.items, 0..) |*block, idx| {
-            if (idx == self.entry or idx == self.exit) {
-                continue;
-            }
-            const in = &self.dfa_in_sets.items[idx];
-            const out = &self.dfa_out_sets.items[idx];
-            const gen = &self.dfa_gen_sets.items[idx];
-            const kill = &self.dfa_kill_sets.items[idx];
-
-            try writer.print("{} [label=<{{Block {}|", .{ idx, idx });
+    pub fn init(graph: *const Cfg, allocator: std.mem.Allocator) !Self {
+        var cnt: usize = 0;
+        for (graph.blocks.items) |*block| {
             for (block.commands.items) |cmd| {
-                try writer.print("({}) {c} = {c}", .{ cmd.idx, cmd.lhs, cmd.a });
-                switch (cmd.op) {
-                    .Add => try writer.print(" + {c};", .{cmd.b}),
-                    .Sub => try writer.print(" - {c};", .{cmd.b}),
-                    .Mul => try writer.print(" * {c};", .{cmd.b}),
-                    .Div => try writer.print(" / {c};", .{cmd.b}),
-                    .None => try writer.print(";", .{}),
-                }
-            }
-            try writer.print("|{{in:", .{});
-            try Self.printSetRenamed(writer, in, name_fn, extra);
-            try writer.print("|out:", .{});
-            try Self.printSetRenamed(writer, out, name_fn, extra);
-            try writer.print("}}|{{gen:", .{});
-            try Self.printSetRenamed(writer, gen, name_fn, extra);
-            try writer.print("|kill:", .{});
-            try Self.printSetRenamed(writer, kill, name_fn, extra);
-
-            try writer.print("}}}}>];\n", .{});
-        }
-
-        for (self.succ_ids.items, 0..) |*set, idx| {
-            var next_it = set.iterator(.{});
-            while (next_it.next()) |i| {
-                try writer.print("{} -> {};\n", .{ idx, i });
+                if (cmd.idx > cnt) cnt = cmd.idx;
             }
         }
+        var self = Self{
+            .cmds = std.ArrayList(Command).init(allocator),
+            .gkt = undefined,
+        };
+        try self.cmds.resize(cnt + 1);
+        for (graph.blocks.items) |*block| {
+            for (block.commands.items) |cmd| {
+                self.cmds.items[cmd.idx] = cmd;
+            }
+        }
+        self.gkt = try dfa.GenKillTransfer(Command).init(
+            allocator,
+            graph.blocks.items.len,
+            self.cmds.items.len,
+            undefined,
+            Self.rd_transfer,
+        );
 
-        try writer.print("}}\n", .{});
+        return self;
+    }
+    pub fn deinit(self: *Self) void {
+        self.cmds.deinit();
+        self.gkt.deinit();
     }
 
-    pub fn init(allocator: std.mem.Allocator) !Self {
+    fn rd_transfer(
+        data: *anyopaque,
+        block_idx: usize,
+        block: *const Block,
+        in: *const std.DynamicBitSet,
+        gen: *std.DynamicBitSet,
+        kill: *std.DynamicBitSet,
+    ) void {
+        _ = block_idx;
+        const self: *Self = @alignCast(@ptrCast(data));
+        std.debug.assert(self.gkt.data == @as(*anyopaque, @ptrCast(self)));
+
+        for (block.commands.items) |cmd| {
+            var in_it = in.iterator(.{});
+            while (in_it.next()) |i| {
+                if (self.cmds.items[i].lhs == cmd.lhs) kill.set(i);
+            }
+            var gen_it = gen.iterator(.{});
+            while (gen_it.next()) |i| {
+                if (self.cmds.items[i].lhs == cmd.lhs) gen.unset(i);
+            }
+
+            kill.unset(cmd.idx);
+            gen.set(cmd.idx);
+        }
+    }
+
+    fn transfer(self: *Self) dfa.Transfer(Command) {
+        self.gkt.data = @ptrCast(self);
+        return self.gkt.transfer();
+    }
+};
+
+const AeTransfer = struct {
+    const BinExpr = struct {
+        u8,
+        Op,
+        u8,
+    };
+    fn eql(self: BinExpr, other: BinExpr) bool {
+        return self[0] == other[0] and self[1] == other[1] and self[2] == other[2];
+    }
+    exprs: std.ArrayList(BinExpr),
+    expr_ids: std.ArrayList(usize),
+    gkt: dfa.GenKillTransfer(Command),
+
+    pub fn init(graph: *Cfg, allocator: std.mem.Allocator) !Self {
         var self = Self{
-            .blocks = std.ArrayList(Block).init(allocator),
-            .pred_ids = std.ArrayList(std.DynamicBitSet).init(allocator),
-            .succ_ids = std.ArrayList(std.DynamicBitSet).init(allocator),
-            .dfa_in_sets = std.ArrayList(std.DynamicBitSet).init(allocator),
-            .dfa_out_sets = std.ArrayList(std.DynamicBitSet).init(allocator),
-            .dfa_gen_sets = std.ArrayList(std.DynamicBitSet).init(allocator),
-            .dfa_kill_sets = std.ArrayList(std.DynamicBitSet).init(allocator),
-            .temp = try std.DynamicBitSet.initEmpty(allocator, 10),
-            .temp_gen = try std.DynamicBitSet.initEmpty(allocator, 10),
-            .temp_kill = try std.DynamicBitSet.initEmpty(allocator, 10),
-            .allocator = allocator,
+            .gkt = undefined,
+            .exprs = std.ArrayList(BinExpr).init(allocator),
+            .expr_ids = std.ArrayList(usize).init(allocator),
         };
-        self.entry = try self.addBlock();
-        self.exit = try self.addBlock();
+        var cnt: usize = 0;
+        for (graph.blocks.items) |*block| {
+            for (block.commands.items) |cmd| {
+                if (cmd.idx > cnt) cnt = cmd.idx;
+            }
+        }
+        try self.expr_ids.resize(cnt + 1);
+
+        for (graph.blocks.items) |*block| {
+            outer: for (block.commands.items) |cmd| {
+                const expr = BinExpr{ cmd.a, cmd.op, cmd.b };
+                for (self.exprs.items, 0..) |other, idx| {
+                    if (eql(expr, other)) {
+                        self.expr_ids.items[cmd.idx] = idx;
+                        continue :outer;
+                    }
+                }
+                const idx = self.exprs.items.len;
+                try self.exprs.append(expr);
+                self.expr_ids.items[cmd.idx] = idx;
+            }
+        }
+        self.gkt = try dfa.GenKillTransfer(Command).init(
+            allocator,
+            graph.blocks.items.len,
+            self.exprs.items.len,
+            undefined,
+            Self.ae_transfer,
+        );
 
         return self;
     }
 
-    pub fn addBlock(self: *Self) !usize {
-        const idx = self.blocks.items.len;
-        try self.blocks.append(Block.init(self.allocator));
-        if (self.blocks.items.len >= self.buf_size) {
-            self.buf_size *= 2;
-            for (self.succ_ids.items) |*set| {
-                try set.resize(self.buf_size, false);
+    pub fn deinit(self: *Self) void {
+        self.exprs.deinit();
+        self.expr_ids.deinit();
+        self.gkt.deinit();
+    }
+
+    const Self = @This();
+    fn ae_transfer(
+        data: *anyopaque,
+        block_idx: usize,
+        block: *const Block,
+        in: *const std.DynamicBitSet,
+        gen: *std.DynamicBitSet,
+        kill: *std.DynamicBitSet,
+    ) void {
+        _ = block_idx;
+        const self: *Self = @alignCast(@ptrCast(data));
+        std.debug.assert(self.gkt.data == @as(*anyopaque, @ptrCast(self)));
+
+        for (block.commands.items) |cmd| {
+            gen.set(self.expr_ids.items[cmd.idx]);
+            kill.unset(self.expr_ids.items[cmd.idx]);
+
+            var in_it = in.iterator(.{});
+            while (in_it.next()) |i| {
+                const expr = self.exprs.items[i];
+                if (expr[0] == cmd.lhs or expr[1] != .None and expr[2] == cmd.lhs) {
+                    kill.set(i);
+                }
             }
-            for (self.pred_ids.items) |*set| {
-                try set.resize(self.buf_size, false);
+            var gen_it = gen.iterator(.{});
+            while (gen_it.next()) |i| {
+                const expr = self.exprs.items[i];
+                if (expr[0] == cmd.lhs or expr[1] != .None and expr[2] == cmd.lhs) {
+                    gen.unset(i);
+                }
             }
         }
-        try self.succ_ids.append(try std.DynamicBitSet.initEmpty(self.allocator, self.buf_size));
-        try self.pred_ids.append(try std.DynamicBitSet.initEmpty(self.allocator, self.buf_size));
-
-        try self.dfa_in_sets.append(try std.DynamicBitSet.initEmpty(self.allocator, 10));
-        try self.dfa_out_sets.append(try std.DynamicBitSet.initEmpty(self.allocator, 10));
-        try self.dfa_gen_sets.append(try std.DynamicBitSet.initEmpty(self.allocator, 10));
-        try self.dfa_kill_sets.append(try std.DynamicBitSet.initEmpty(self.allocator, 10));
-
-        return idx;
     }
-    pub inline fn addCommand(self: *Self, cmd: Command, block: usize) !void {
-        try self.blocks.items[block].commands.append(cmd);
-    }
-
-    pub inline fn connectBlocks(self: *Self, from: usize, to: usize) void {
-        self.succ_ids.items[from].set(to);
-        self.pred_ids.items[to].set(from);
-    }
-    pub inline fn setExit(self: *Self, block: usize) void {
-        self.connectBlocks(block, self.exit);
-    }
-    pub inline fn setEntry(self: *Self, block: usize) void {
-        self.connectBlocks(self.entry, block);
+    fn transfer(self: *Self) dfa.Transfer(Command) {
+        self.gkt.data = @ptrCast(self);
+        return self.gkt.transfer();
     }
 };
 
-fn union_meet(
-    res: *std.DynamicBitSet,
-    args: *const std.DynamicBitSet,
-    sets: []std.DynamicBitSet,
-) void {
-    var it = args.iterator(.{});
-    if (it.next()) |first| {
-        Cfg.initSetTo(res, &sets[first]) catch unreachable;
-        while (it.next()) |next| res.setUnion(sets[next]);
-    } else {
-        Cfg.initSetToEmpty(res, res.unmanaged.bit_length) catch unreachable;
-    }
-}
-fn intersect_meet(
-    res: *std.DynamicBitSet,
-    args: *const std.DynamicBitSet,
-    sets: []std.DynamicBitSet,
-) void {
-    var it = args.iterator(.{});
-    if (it.next()) |first| {
-        Cfg.initSetTo(res, &sets[first]) catch unreachable;
-        while (it.next()) |next| res.setIntersection(sets[next]);
-    } else {
-        Cfg.initSetToEmpty(res, res.unmanaged.bit_length) catch unreachable;
-    }
-}
+pub const LvTransfer = struct {
+    const Self = @This();
+    gkt: dfa.GenKillTransfer(Command),
 
-fn rd_transfer(
-    block: *const Block,
-    in: *const std.DynamicBitSet,
-    gen: *std.DynamicBitSet,
-    kill: *std.DynamicBitSet,
-    extra: anytype,
-) void {
-    const cmds = @as([]Command, extra);
+    pub fn init(graph: *Cfg, allocator: std.mem.Allocator) !Self {
+        var self = Self{ .gkt = undefined };
+        self.gkt = try dfa.GenKillTransfer(Command).init(
+            allocator,
+            graph.blocks.items.len,
+            256,
+            undefined,
+            Self.lv_transfer,
+        );
 
-    for (block.commands.items) |cmd| {
-        var in_it = in.iterator(.{});
-        while (in_it.next()) |i| {
-            if (cmds[i].lhs == cmd.lhs) kill.set(i);
+        return self;
+    }
+    pub fn deinit(self: *Self) void {
+        self.gkt.deinit();
+    }
+
+    fn lv_transfer(
+        data: *anyopaque,
+        block_idx: usize,
+        block: *const Block,
+        out: *const std.DynamicBitSet,
+        use: *std.DynamicBitSet,
+        def: *std.DynamicBitSet,
+    ) void {
+        const self: *Self = @alignCast(@ptrCast(data));
+        std.debug.assert(self.gkt.data == @as(*anyopaque, @ptrCast(self)));
+
+        _ = out;
+        _ = block_idx;
+        const cnt = def.unmanaged.bit_length;
+        dfa.initSetToEmpty(def, cnt) catch unreachable;
+        dfa.initSetToEmpty(use, cnt) catch unreachable;
+        for (block.commands.items, 0..) |_, i| {
+            const cmd = block.commands.items[block.commands.items.len - i - 1];
+            use.unset(cmd.lhs);
+            def.unset(cmd.a);
+            if (cmd.op != .None) def.unset(cmd.b);
+
+            use.set(cmd.a);
+            if (cmd.op != .None) use.set(cmd.b);
+            def.set(cmd.lhs);
         }
-        var gen_it = gen.iterator(.{});
-        while (gen_it.next()) |i| {
-            if (cmds[i].lhs == cmd.lhs) gen.unset(i);
-        }
-
-        kill.unset(cmd.idx);
-        gen.set(cmd.idx);
     }
-}
-
-const AeMaps = struct {
-    const BinExpr = struct { u8, Op, u8 };
-    exprs: []BinExpr,
-    expr_ids: []usize,
+    fn transfer(self: *Self) dfa.Transfer(Command) {
+        self.gkt.data = @ptrCast(self);
+        return self.gkt.transfer();
+    }
 };
-fn ae_transfer(
-    block: *const Block,
-    in: *const std.DynamicBitSet,
-    gen: *std.DynamicBitSet,
-    kill: *std.DynamicBitSet,
-    extra: anytype,
-) void {
-    const maps = @as(AeMaps, extra);
 
-    for (block.commands.items) |cmd| {
-        gen.set(maps.expr_ids[cmd.idx]);
-        kill.unset(maps.expr_ids[cmd.idx]);
+const RdPrinter = struct {
+    const Self = @This();
+    rd: *const RdTransfer,
+    dfa: *const dfa.Dfa,
 
-        var in_it = in.iterator(.{});
-        while (in_it.next()) |i| {
-            const expr = maps.exprs[i];
-            if (expr[0] == cmd.lhs or expr[1] != .None and expr[2] == cmd.lhs) {
-                kill.set(i);
+    fn print(
+        data: *anyopaque,
+        w: std.io.AnyWriter,
+        block: *const Cfg.Block,
+        block_idx: usize,
+    ) anyerror!void {
+        const self: *Self = @alignCast(@ptrCast(data));
+        _ = block;
+
+        const in = &self.dfa.ins.items[block_idx];
+        const out = &self.dfa.outs.items[block_idx];
+        const gen = &self.rd.gkt.gens.items[block_idx];
+        const kill = &self.rd.gkt.kills.items[block_idx];
+
+        try w.print("{{in:", .{});
+        try dfa.printSet(w, in);
+        try w.print("|out:", .{});
+        try dfa.printSet(w, out);
+        try w.print("}}|{{gen:", .{});
+        try dfa.printSet(w, gen);
+        try w.print("|kill:", .{});
+        try dfa.printSet(w, kill);
+        try w.print("}}", .{});
+    }
+
+    pub fn printer(self: *Self) cfg.PrintBlockMetadata(Command) {
+        return .{
+            .data = @ptrCast(self),
+            .fptr = Self.print,
+        };
+    }
+};
+const AePrinter = struct {
+    const Self = @This();
+    ae: *const AeTransfer,
+    dfa: *const dfa.Dfa,
+
+    fn print(
+        data: *anyopaque,
+        w: std.io.AnyWriter,
+        block: *const Cfg.Block,
+        block_idx: usize,
+    ) anyerror!void {
+        const self: *Self = @alignCast(@ptrCast(data));
+        _ = block;
+
+        const in = &self.dfa.ins.items[block_idx];
+        const out = &self.dfa.outs.items[block_idx];
+        const gen = &self.ae.gkt.gens.items[block_idx];
+        const kill = &self.ae.gkt.kills.items[block_idx];
+
+        try w.print("{{in:", .{});
+        try self.printExprSet(w, in);
+        try w.print("|out:", .{});
+        try self.printExprSet(w, out);
+        try w.print("}}|{{gen:", .{});
+        try self.printExprSet(w, gen);
+        try w.print("|kill:", .{});
+        try self.printExprSet(w, kill);
+        try w.print("}}", .{});
+    }
+
+    fn printExprSet(self: *const Self, w: std.io.AnyWriter, set: *const std.DynamicBitSet) !void {
+        try w.print("[", .{});
+
+        var it = set.iterator(.{});
+        while (it.next()) |x| {
+            const expr = self.ae.exprs.items[x];
+            try w.print("'{c}", .{expr[0]});
+            switch (expr[1]) {
+                .Add => try w.print(" + {c}', ", .{expr[2]}),
+                .Sub => try w.print(" - {c}', ", .{expr[2]}),
+                .Mul => try w.print(" * {c}', ", .{expr[2]}),
+                .Div => try w.print(" / {c}', ", .{expr[2]}),
+                .None => try w.print("', ", .{}),
             }
         }
-        var gen_it = gen.iterator(.{});
-        while (gen_it.next()) |i| {
-            const expr = maps.exprs[i];
-            if (expr[0] == cmd.lhs or expr[1] != .None and expr[2] == cmd.lhs) {
-                gen.unset(i);
-            }
-        }
+
+        try w.print("]", .{});
     }
-}
 
-// def: set of all vars defined without a previous usage in that block
-// use: set of all vars used without a previous definition in that block
-fn lv_transfer(
-    block: *const Block,
-    out: *const std.DynamicBitSet,
-    use: *std.DynamicBitSet,
-    def: *std.DynamicBitSet,
-    extra: anytype,
-) void {
-    _ = out;
-    _ = extra;
-    const cnt = def.unmanaged.bit_length;
-    Cfg.initSetToEmpty(def, cnt) catch unreachable;
-    Cfg.initSetToEmpty(use, cnt) catch unreachable;
-    for (block.commands.items, 0..) |_, i| {
-        const cmd = block.commands.items[block.commands.items.len - i - 1];
-        use.unset(cmd.lhs);
-        def.unset(cmd.a);
-        if (cmd.op != .None) def.unset(cmd.b);
-
-        use.set(cmd.a);
-        if (cmd.op != .None) use.set(cmd.b);
-        def.set(cmd.lhs);
+    pub fn printer(self: *Self) cfg.PrintBlockMetadata(Command) {
+        return .{
+            .data = @ptrCast(self),
+            .fptr = Self.print,
+        };
     }
-}
+};
+const LvPrinter = struct {
+    const Self = @This();
+    lv: *const LvTransfer,
+    dfa: *const dfa.Dfa,
 
-fn normal_name(writer: std.io.AnyWriter, idx: usize, extra: anytype) anyerror!void {
-    _ = extra;
-    try writer.print("{}", .{idx});
-}
-fn char_name(writer: std.io.AnyWriter, idx: usize, extra: anytype) anyerror!void {
-    _ = extra;
-    try writer.print("{c}", .{@as(u8, @intCast(idx))});
-}
+    fn print(
+        data: *anyopaque,
+        w: std.io.AnyWriter,
+        block: *const Cfg.Block,
+        block_idx: usize,
+    ) anyerror!void {
+        const self: *Self = @alignCast(@ptrCast(data));
+        _ = block;
 
-fn expr_name(writer: std.io.AnyWriter, idx: usize, extra: anytype) anyerror!void {
-    const maps = @as(AeMaps, extra);
-    const expr = maps.exprs[idx];
+        const in = &self.dfa.ins.items[block_idx];
+        const out = &self.dfa.outs.items[block_idx];
+        const use = &self.lv.gkt.gens.items[block_idx];
+        const def = &self.lv.gkt.kills.items[block_idx];
 
-    try writer.print("'{c}", .{expr[0]});
-    switch (expr[1]) {
-        .Add => try writer.print(" + {c}'", .{expr[2]}),
-        .Sub => try writer.print(" - {c}'", .{expr[2]}),
-        .Mul => try writer.print(" * {c}'", .{expr[2]}),
-        .Div => try writer.print(" / {c}'", .{expr[2]}),
-        .None => try writer.print("'", .{}),
+        try w.print("{{in:", .{});
+        try self.printCharSet(w, in);
+        try w.print("|out:", .{});
+        try self.printCharSet(w, out);
+        try w.print("}}|{{use:", .{});
+        try self.printCharSet(w, use);
+        try w.print("|def:", .{});
+        try self.printCharSet(w, def);
+        try w.print("}}", .{});
     }
-}
+
+    fn printCharSet(self: *const Self, w: std.io.AnyWriter, set: *const std.DynamicBitSet) !void {
+        _ = self;
+        try w.print("[", .{});
+        var it = set.iterator(.{});
+        while (it.next()) |c| try w.print("{c}, ", .{@as(u8, @intCast(c))});
+        try w.print("]", .{});
+    }
+
+    pub fn printer(self: *Self) cfg.PrintBlockMetadata(Command) {
+        return .{
+            .data = @ptrCast(self),
+            .fptr = Self.print,
+        };
+    }
+};
 
 pub fn main() !void {
-    var alloc = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.print("GPA: {}\n", .{alloc.deinit()});
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.print("GPA: {}\n", .{gpa.deinit()});
 
-    var cfg = try Cfg.init(alloc.allocator());
-    defer cfg.deinit();
+    var graph = try cfg.Cfg(Command).init(gpa.allocator());
+    defer graph.deinit();
 
-    var commands = try std.ArrayList(Command).initCapacity(alloc.allocator(), 12);
+    var commands = try std.ArrayList(Command).initCapacity(gpa.allocator(), 12);
     defer commands.deinit();
     try commands.append(undefined);
 
@@ -470,91 +412,105 @@ pub fn main() !void {
     try commands.append(.{ .lhs = 'a', .a = 'b', .op = .Mul, .b = 'd', .idx = 10 });
     try commands.append(.{ .lhs = 'b', .a = 'a', .op = .Sub, .b = 'd', .idx = 11 });
 
-    const b1 = try cfg.addBlock();
-    try cfg.addCommand(commands.items[1], b1);
-    try cfg.addCommand(commands.items[2], b1);
-    const b2 = try cfg.addBlock();
-    try cfg.addCommand(commands.items[3], b2);
-    try cfg.addCommand(commands.items[4], b2);
-    const b3 = try cfg.addBlock();
-    try cfg.addCommand(commands.items[5], b3);
-    const b4 = try cfg.addBlock();
-    try cfg.addCommand(commands.items[6], b4);
-    try cfg.addCommand(commands.items[7], b4);
-    const b5 = try cfg.addBlock();
-    try cfg.addCommand(commands.items[8], b5);
-    try cfg.addCommand(commands.items[9], b5);
-    const b6 = try cfg.addBlock();
-    try cfg.addCommand(commands.items[10], b6);
-    try cfg.addCommand(commands.items[11], b6);
-    cfg.setEntry(b1);
-    cfg.connectBlocks(b1, b2);
-    cfg.connectBlocks(b2, b3);
-    cfg.connectBlocks(b3, b4);
-    cfg.connectBlocks(b4, b3);
-    cfg.connectBlocks(b3, b5);
-    cfg.connectBlocks(b5, b2);
-    cfg.connectBlocks(b5, b6);
-    cfg.setExit(b6);
+    const b1 = try graph.addBlock();
+    try graph.addCommand(commands.items[1], b1);
+    try graph.addCommand(commands.items[2], b1);
+    const b2 = try graph.addBlock();
+    try graph.addCommand(commands.items[3], b2);
+    try graph.addCommand(commands.items[4], b2);
+    const b3 = try graph.addBlock();
+    try graph.addCommand(commands.items[5], b3);
+    const b4 = try graph.addBlock();
+    try graph.addCommand(commands.items[6], b4);
+    try graph.addCommand(commands.items[7], b4);
+    const b5 = try graph.addBlock();
+    try graph.addCommand(commands.items[8], b5);
+    try graph.addCommand(commands.items[9], b5);
+    const b6 = try graph.addBlock();
+    try graph.addCommand(commands.items[10], b6);
+    try graph.addCommand(commands.items[11], b6);
+    try graph.setEntry(b1);
+    try graph.connectBlocks(b1, b2);
+    try graph.connectBlocks(b2, b3);
+    try graph.connectBlocks(b3, b4);
+    try graph.connectBlocks(b4, b3);
+    try graph.connectBlocks(b3, b5);
+    try graph.connectBlocks(b5, b2);
+    try graph.connectBlocks(b5, b6);
+    try graph.setExit(b6);
 
     {
-        var empty = try std.DynamicBitSet.initEmpty(alloc.allocator(), 12);
+        var rd = try RdTransfer.init(&graph, gpa.allocator());
+        defer rd.deinit();
+
+        var empty = try std.DynamicBitSet.initEmpty(gpa.allocator(), rd.cmds.items.len);
         defer empty.deinit();
-        try cfg.dfa(empty, empty, .Forward, rd_transfer, commands.items, union_meet);
-        var rd_file = try std.fs.cwd().createFile("rd.dot", .{});
-        defer rd_file.close();
-        try cfg.dump(rd_file.writer().any(), normal_name, .{});
+
+        var res = try dfa.Dfa.init(
+            Command,
+            &graph,
+            .Forward,
+            rd.transfer(),
+            dfa.UnionMeet.meet(),
+            &empty,
+            &empty,
+            gpa.allocator(),
+        );
+        defer res.deinit();
+
+        var f = try std.fs.cwd().createFile("rd.dot", .{});
+        defer f.close();
+        var printer = RdPrinter{ .rd = &rd, .dfa = &res };
+        try graph.dump(f.writer().any(), printer.printer());
     }
     {
-        var empty = try std.DynamicBitSet.initEmpty(alloc.allocator(), 256);
+        var ae = try AeTransfer.init(&graph, gpa.allocator());
+        defer ae.deinit();
+
+        var empty = try std.DynamicBitSet.initEmpty(gpa.allocator(), ae.exprs.items.len);
         defer empty.deinit();
-        try cfg.dfa(empty, empty, .Backward, lv_transfer, .{}, union_meet);
-        var rd_file = try std.fs.cwd().createFile("lv.dot", .{});
-        defer rd_file.close();
-        try cfg.dump(rd_file.writer().any(), char_name, .{});
-    }
-    {
-        var expr_ids = std.ArrayList(usize).init(alloc.allocator());
-        defer expr_ids.deinit();
-        var exprs = std.ArrayList(AeMaps.BinExpr).init(alloc.allocator());
-        defer exprs.deinit();
-        try expr_ids.resize(12);
-
-        expr_ids.items[1] = 1;
-        expr_ids.items[2] = 2;
-        expr_ids.items[3] = 3;
-        expr_ids.items[4] = 4;
-        expr_ids.items[5] = 5;
-        expr_ids.items[6] = 3;
-        expr_ids.items[7] = 6;
-        expr_ids.items[8] = 7;
-        expr_ids.items[9] = 4;
-        expr_ids.items[10] = 8;
-        expr_ids.items[11] = 9;
-
-        try exprs.resize(10);
-        exprs.items[1] = .{ '1', .None, 0 };
-        exprs.items[2] = .{ '2', .None, 0 };
-        exprs.items[3] = .{ 'a', .Add, 'b' };
-        exprs.items[4] = .{ 'c', .Sub, 'a' };
-        exprs.items[5] = .{ 'b', .Add, 'd' };
-        exprs.items[6] = .{ 'e', .Add, '1' };
-        exprs.items[7] = .{ 'a', .Add, 'd' };
-        exprs.items[8] = .{ 'b', .Mul, 'd' };
-        exprs.items[9] = .{ 'a', .Sub, 'd' };
-
-        const maps = AeMaps{
-            .expr_ids = expr_ids.items,
-            .exprs = exprs.items,
-        };
-        var full = try std.DynamicBitSet.initFull(alloc.allocator(), 10);
+        var full = try std.DynamicBitSet.initFull(gpa.allocator(), ae.exprs.items.len);
         defer full.deinit();
-        full.unset(0);
-        var empty = try std.DynamicBitSet.initEmpty(alloc.allocator(), 10);
+
+        var res = try dfa.Dfa.init(
+            Command,
+            &graph,
+            .Forward,
+            ae.transfer(),
+            dfa.IntersectMeet.meet(),
+            &empty,
+            &full,
+            gpa.allocator(),
+        );
+        defer res.deinit();
+
+        var f = try std.fs.cwd().createFile("ae.dot", .{});
+        defer f.close();
+        var printer = AePrinter{ .ae = &ae, .dfa = &res };
+        try graph.dump(f.writer().any(), printer.printer());
+    }
+    {
+        var lv = try LvTransfer.init(&graph, gpa.allocator());
+        defer lv.deinit();
+
+        var empty = try std.DynamicBitSet.initEmpty(gpa.allocator(), 256);
         defer empty.deinit();
-        try cfg.dfa(empty, full, .Forward, ae_transfer, maps, intersect_meet);
-        var rd_file = try std.fs.cwd().createFile("ae.dot", .{});
-        defer rd_file.close();
-        try cfg.dump(rd_file.writer().any(), expr_name, maps);
+
+        var res = try dfa.Dfa.init(
+            Command,
+            &graph,
+            .Backward,
+            lv.transfer(),
+            dfa.UnionMeet.meet(),
+            &empty,
+            &empty,
+            gpa.allocator(),
+        );
+        defer res.deinit();
+
+        var f = try std.fs.cwd().createFile("lv.dot", .{});
+        defer f.close();
+        var printer = LvPrinter{ .lv = &lv, .dfa = &res };
+        try graph.dump(f.writer().any(), printer.printer());
     }
 }
