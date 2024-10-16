@@ -239,8 +239,8 @@ pub const LvTransfer = struct {
             def.unset(cmd.a);
             if (cmd.op != .None) def.unset(cmd.b);
 
-            use.set(cmd.a);
-            if (cmd.op != .None) use.set(cmd.b);
+            if (std.ascii.isAlphabetic(cmd.a)) use.set(cmd.a);
+            if (cmd.op != .None and std.ascii.isAlphabetic(cmd.b)) use.set(cmd.b);
             def.set(cmd.lhs);
         }
     }

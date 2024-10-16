@@ -2,11 +2,11 @@ digraph {
 node [shape=record];
 0 [label="ENTRY"];
 1 [label="EXIT"];
-2 [label=<{Block 2|(1) a = 1;(2) b = 2;|{in:[1, 2, e, ]|out:[1, a, b, e, ]}|{use:[1, 2, ]|def:[a, b, ]}}>];
-3 [label=<{Block 3|(3) c = a + b;(4) d = c - a;|{in:[1, a, b, e, ]|out:[1, a, b, c, d, e, ]}|{use:[a, b, ]|def:[c, d, ]}}>];
-4 [label=<{Block 4|(5) d = b + d;|{in:[1, a, b, c, d, e, ]|out:[1, a, b, c, d, e, ]}|{use:[b, d, ]|def:[d, ]}}>];
-5 [label=<{Block 5|(6) d = a + b;(7) e = e + 1;|{in:[1, a, b, c, e, ]|out:[1, a, b, c, d, e, ]}|{use:[1, a, b, e, ]|def:[d, e, ]}}>];
-6 [label=<{Block 6|(8) b = a + d;(9) e = c - a;|{in:[1, a, c, d, ]|out:[1, a, b, d, e, ]}|{use:[a, c, d, ]|def:[b, e, ]}}>];
+2 [label=<{Block 2|(1) a = 1;(2) b = 2;|{in:[e, ]|out:[a, b, e, ]}|{use:[]|def:[a, b, ]}}>];
+3 [label=<{Block 3|(3) c = a + b;(4) d = c - a;|{in:[a, b, e, ]|out:[a, b, c, d, e, ]}|{use:[a, b, ]|def:[c, d, ]}}>];
+4 [label=<{Block 4|(5) d = b + d;|{in:[a, b, c, d, e, ]|out:[a, b, c, d, e, ]}|{use:[b, d, ]|def:[d, ]}}>];
+5 [label=<{Block 5|(6) d = a + b;(7) e = e + 1;|{in:[a, b, c, e, ]|out:[a, b, c, d, e, ]}|{use:[a, b, e, ]|def:[d, e, ]}}>];
+6 [label=<{Block 6|(8) b = a + d;(9) e = c - a;|{in:[a, c, d, ]|out:[a, b, d, e, ]}|{use:[a, c, d, ]|def:[b, e, ]}}>];
 7 [label=<{Block 7|(10) a = b * d;(11) b = a - d;|{in:[b, d, ]|out:[]}|{use:[b, d, ]|def:[a, ]}}>];
 0 -> 2;
 2 -> 3;
