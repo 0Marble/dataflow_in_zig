@@ -1,5 +1,5 @@
 const std = @import("std");
-const cfg = @import("cfg.zig");
+const cfg = @import("../cfg.zig");
 
 pub const Dir = enum { Forward, Backward };
 
@@ -210,7 +210,7 @@ pub const IntersectMeet = struct {
             initSetToEmpty(res, res.unmanaged.bit_length) catch unreachable;
         } else {
             copySet(res, &sets[set_ids[0]]) catch unreachable;
-            for (set_ids[1..]) |i| res.setUnion(sets[i]);
+            for (set_ids[1..]) |i| res.setIntersection(sets[i]);
         }
     }
 

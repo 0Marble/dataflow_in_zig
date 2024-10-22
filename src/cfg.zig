@@ -9,6 +9,8 @@ pub fn Cfg(comptime Command: type) type {
         exit: usize = 1,
         allocator: std.mem.Allocator,
 
+        pub const CommandType: type = Command;
+
         pub const Block = struct {
             commands: std.ArrayList(Command),
             fn init(allocator: std.mem.Allocator) Block {
@@ -65,7 +67,7 @@ pub fn Cfg(comptime Command: type) type {
         }
 
         pub fn dump(
-            self: *Self,
+            self: *const Self,
             writer: std.io.AnyWriter,
             print_block_meta: PrintBlockMetadata(Command),
         ) !void {
